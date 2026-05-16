@@ -391,60 +391,82 @@ def dashboard(
         raise HTTPException(status_code=500, detail=f"Erro ao consultar MLflow: {str(e)}")
 
 
-@app.get("/dashboard/{trace_id}", response_model=EvalResult, tags=["Dashboard"])
-def get_trace_result(trace_id: str):
+@app.get("/dashboard/{run_name}", response_model=DashboardResponse, tags=["Dashboard"])
+def get_agent_runs(run_name: str, limit: int = 100, only_successful: bool = False):
     """
-    Returns the result of the evaluation of a specific trace.
+    Returns all evaluation runs for a given agent (matched by run_name prefix or service_name tag).
+    Use this to retrieve the full history of a specific agent identified by its service_name.
     """
     try:
         experiment = mlflow.get_experiment_by_name(EXPERIMENT_NAME)
         if experiment is None:
             raise HTTPException(status_code=404, detail="Experimento não encontrado no MLflow.")
 
+        filter_string = "tags.eval_status = 'success'" if only_successful else ""
+
         runs_df = mlflow.search_runs(
             experiment_ids=[experiment.experiment_id],
-            filter_string=f"tags.trace_id = '{trace_id}'",
-            max_results=100,
+            filter_string=filter_string,
+            max_results=limit * 5,
             order_by=["start_time DESC"],
         )
 
         if runs_df.empty:
+            raise HTTPException(status_code=404, detail=f"Nenhuma run encontrada para '{run_name}'.")
+
+        # Filtra por substring em run_name ou service_name tag
+        run_name_lower = run_name.lower()
+        mask = (
+            runs_df.get("tags.mlflow.runName", "").str.lower().str.contains(run_name_lower, na=False)
+            | runs_df.get("tags.service_name", "").str.lower().str.contains(run_name_lower, na=False)
+        )
+        runs_df = runs_df[mask].head(limit)
+
+        if runs_df.empty:
             raise HTTPException(
                 status_code=404,
-                detail=f"Trace '{trace_id}' não encontrado. Pode ainda estar sendo processado.",
+                detail=f"Agente '{run_name}' não encontrado. Verifique o service_name usado em ats.init().",
             )
 
-        row = runs_df.iloc[0]
         tracking_uri = mlflow.get_tracking_uri()
+        runs: List[EvalResult] = []
 
-        metrics = {
-            k.replace("metrics.", ""): v
-            for k, v in row.items()
-            if k.startswith("metrics.") and not (isinstance(v, float) and v != v)
-        }
-        params = {
-            k.replace("params.", ""): v
-            for k, v in row.items()
-            if k.startswith("params.") and v is not None
-        }
-        tags_out = {
-            k.replace("tags.", ""): str(v)
-            for k, v in row.items()
-            if k.startswith("tags.") and v is not None
-        }
+        for _, row in runs_df.iterrows():
+            metrics = {
+                k.replace("metrics.", ""): v
+                for k, v in row.items()
+                if k.startswith("metrics.") and not (isinstance(v, float) and v != v)
+            }
+            params = {
+                k.replace("params.", ""): v
+                for k, v in row.items()
+                if k.startswith("params.") and v is not None
+            }
+            tags_out = {
+                k.replace("tags.", ""): str(v)
+                for k, v in row.items()
+                if k.startswith("tags.") and v is not None
+            }
+            run_url = f"{tracking_uri}/#/experiments/{experiment.experiment_id}/runs/{row['run_id']}"
+            runs.append(
+                EvalResult(
+                    trace_id=tags_out.get("trace_id", ""),
+                    run_id=row["run_id"],
+                    run_name=row.get("tags.mlflow.runName", row["run_id"]),
+                    status=tags_out.get("eval_status", "unknown"),
+                    start_time=str(row.get("start_time", "")),
+                    metrics=metrics,
+                    params=params,
+                    tags=tags_out,
+                    mlflow_url=run_url,
+                )
+            )
 
-        run_url = f"{tracking_uri}/#/experiments/{experiment.experiment_id}/runs/{row['run_id']}"
-
-        return EvalResult(
-            trace_id=trace_id,
-            run_id=row["run_id"],
-            run_name=row.get("tags.mlflow.runName", row["run_id"]),
-            status=tags_out.get("eval_status", "unknown"),
-            start_time=str(row.get("start_time", "")),
-            metrics=metrics,
-            params=params,
-            tags=tags_out,
-            mlflow_url=run_url,
+        return DashboardResponse(
+            experiment_name=EXPERIMENT_NAME,
+            experiment_id=experiment.experiment_id,
+            total_runs=len(runs),
+            runs=runs,
         )
 
     except HTTPException:
