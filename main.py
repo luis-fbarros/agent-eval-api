@@ -238,74 +238,109 @@ async def ingest(payload: IngestPayload, background_tasks: BackgroundTasks):
         message=f"Trace '{trace_id}' enfileirado para avaliação. Acompanhe em /dashboard.",
     )
 
-
 @app.get("/dashboard/agents", response_model=AgentsDashboardResponse, tags=["Dashboard"])
 def get_agents():
     """
-    Returns a list of all distinct agents from BigQuery, grouped by their names.
+    Returns a list of all distinct agents from MLflow, grouped by their names.
     Calculates active/inactive status based on the last 7 days.
     """
-    if not bq_client:
-        raise HTTPException(status_code=500, detail="BigQuery client not initialized.")
-
-    query = """
-        SELECT 
-            jsonPayload.agent_name, 
-            MAX(timestamp) as last_seen,
-            COUNT(*) as total_traces
-        FROM `hackathon-equipe-6.agentes_analytics.agent_tracer_logs_*`
-        WHERE jsonPayload.agent_name IS NOT NULL 
-          AND TRIM(jsonPayload.agent_name) != ''
-        GROUP BY jsonPayload.agent_name
-    """
-
     try:
-        query_job = bq_client.query(query)
-        results = query_job.result()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao consultar o BigQuery: {str(e)}")
+        experiment = mlflow.get_experiment_by_name(EXPERIMENT_NAME)
+        if experiment is None:
+            raise HTTPException(status_code=404, detail="Experimento não encontrado no MLflow.")
 
-    agents_list = []
-    active_count = 0
-    inactive_count = 0
-    now_utc = datetime.now(timezone.utc)
-    seven_days_ago = now_utc - timedelta(days=7)
-
-    for row in results:
-        agent_name = row["agent_name"]
-        last_seen = row["last_seen"] 
-        total_traces = row["total_traces"]
-
-        # If last_seen is naive, make it UTC, though BigQuery typically returns UTC
-        if last_seen.tzinfo is None:
-            last_seen = last_seen.replace(tzinfo=timezone.utc)
-
-        status = "ativo" if last_seen >= seven_days_ago else "inativo"
-
-        if status == "ativo":
-            active_count += 1
-        else:
-            inactive_count += 1
-
-        # Using the name as an ID for simplicity
-        agent_id = agent_name.lower().replace(" ", "-")
-
-        agents_list.append(
-            AgentInfo(
-                agent_id=agent_id,
-                agent_name=agent_name,
-                status=status,
-                last_seen=last_seen.isoformat(),
-                total_traces=total_traces,
-            )
+        runs_df = mlflow.search_runs(
+            experiment_ids=[experiment.experiment_id],
+            max_results=1000,
+            order_by=["start_time DESC"],
         )
 
-    return AgentsDashboardResponse(
-        total_agents=len(agents_list),
-        active_agents=active_count,
-        inactive_agents=inactive_count,
-        agents=agents_list
-    )
+        if runs_df.empty:
+            return AgentsDashboardResponse(total_agents=0, active_agents=0, inactive_agents=0, agents=[])
+
+        # Encontrar a coluna que contém o nome do agente (pode variar dependendo de como foi logado)
+        possible_cols = [
+            "tags.agent_tracer.agent_name", 
+            "params.agent_tracer.agent_name", 
+            "tags.service_name", 
+            "tags.mlflow.runName"
+        ]
+        agent_col = None
+        for col in possible_cols:
+            if col in runs_df.columns:
+                agent_col = col
+                break
+
+        if not agent_col:
+            # Se não houver nenhum agente rastreado
+            return AgentsDashboardResponse(total_agents=0, active_agents=0, inactive_agents=0, agents=[])
+
+        agents_map = {}
+        now_utc = datetime.now(timezone.utc)
+        seven_days_ago = now_utc - timedelta(days=7)
+
+        for _, row in runs_df.iterrows():
+            agent_name = row.get(agent_col)
+            if not isinstance(agent_name, str) or not agent_name.strip() or agent_name.strip().lower() == "unknown":
+                continue
+            
+            agent_name = agent_name.strip()
+            start_time = row.get("start_time")
+            
+            import pandas as pd
+            if pd.notnull(start_time):
+                start_time = pd.to_datetime(start_time)
+                if start_time.tzinfo is None:
+                    start_time = start_time.replace(tzinfo=timezone.utc)
+            else:
+                start_time = now_utc
+
+            if agent_name not in agents_map:
+                agents_map[agent_name] = {
+                    "last_seen": start_time,
+                    "total_traces": 0
+                }
+            
+            agents_map[agent_name]["total_traces"] += 1
+            if start_time > agents_map[agent_name]["last_seen"]:
+                agents_map[agent_name]["last_seen"] = start_time
+
+        agents_list = []
+        active_count = 0
+        inactive_count = 0
+
+        for agent_name, data in agents_map.items():
+            last_seen = data["last_seen"]
+            status = "ativo" if last_seen >= seven_days_ago else "inativo"
+
+            if status == "ativo":
+                active_count += 1
+            else:
+                inactive_count += 1
+
+            agent_id = agent_name.lower().replace(" ", "-")
+
+            agents_list.append(
+                AgentInfo(
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    status=status,
+                    last_seen=last_seen.isoformat(),
+                    total_traces=data["total_traces"],
+                )
+            )
+
+        return AgentsDashboardResponse(
+            total_agents=len(agents_list),
+            active_agents=active_count,
+            inactive_agents=inactive_count,
+            agents=agents_list
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao consultar o MLflow: {str(e)}")
 
 
 @app.get("/dashboard", response_model=DashboardResponse, tags=["Dashboard"])
