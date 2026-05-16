@@ -13,3 +13,6 @@ dagshub>=0.3.27
 
 # DeepEval (avaliação semântica)
 deepeval>=0.21.0
+
+# BigQuery
+google-cloud-bigquery>=3.20.0
