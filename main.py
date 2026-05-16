@@ -219,9 +219,14 @@ async def ingest(payload: IngestPayload, background_tasks: BackgroundTasks):
 
 
 @app.get("/dashboard", response_model=DashboardResponse, tags=["Dashboard"])
-def dashboard(limit: int = 50, only_successful: bool = False):
+def dashboard(
+    limit: int = 50,
+    only_successful: bool = False,
+    agent_id: Optional[str] = None,
+):
     """
     Returns the results of all evaluations registered in MLflow/DagsHub.
+    Optionally filter by agent_id (matches run_name or tags.service_name).
     """
     try:
         experiment = mlflow.get_experiment_by_name(EXPERIMENT_NAME)
@@ -233,9 +238,19 @@ def dashboard(limit: int = 50, only_successful: bool = False):
         runs_df = mlflow.search_runs(
             experiment_ids=[experiment.experiment_id],
             filter_string=filter_string,
-            max_results=limit,
+            max_results=limit * 5 if agent_id else limit,
             order_by=["start_time DESC"],
         )
+
+        # Post-filtragem por agent_id (substring match em run_name e service_name)
+        if agent_id and not runs_df.empty:
+            agent_id_lower = agent_id.lower()
+            mask = (
+                runs_df.get("tags.mlflow.runName", "").str.lower().str.contains(agent_id_lower, na=False)
+                | runs_df.get("tags.service_name", "").str.lower().str.contains(agent_id_lower, na=False)
+                | runs_df.get("tags.trace_id", "").str.lower().str.contains(agent_id_lower, na=False)
+            )
+            runs_df = runs_df[mask].head(limit)
 
         runs: List[EvalResult] = []
         tracking_uri = mlflow.get_tracking_uri()
@@ -299,7 +314,8 @@ def get_trace_result(trace_id: str):
         runs_df = mlflow.search_runs(
             experiment_ids=[experiment.experiment_id],
             filter_string=f"tags.trace_id = '{trace_id}'",
-            max_results=1,
+            max_results=100,
+            order_by=["start_time DESC"],
         )
 
         if runs_df.empty:
