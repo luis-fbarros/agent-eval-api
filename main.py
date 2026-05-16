@@ -131,6 +131,9 @@ def _run_eval_pipeline(trace_id: str, payload_dict: dict, run_name: str, extra_t
         mlflow.set_tag("trace_id", trace_id)
         mlflow.set_tag("pipeline_version", "1.0.0")
         mlflow.set_tag("evaluated_at", datetime.utcnow().isoformat())
+        # Garante service_name pesquisável mesmo sem o AgentTracer SDK
+        if "service_name" not in extra_tags:
+            mlflow.set_tag("service_name", run_name)
         for k, v in extra_tags.items():
             mlflow.set_tag(k, v)
 
@@ -369,11 +372,19 @@ def dashboard(
 
         # Post-filtragem por agent_id (substring match em run_name e service_name)
         if agent_id and not runs_df.empty:
+            import pandas as pd
             agent_id_lower = agent_id.lower()
+
+            def _scol(df, col):
+                """Series de strings minúsculas; vazia se coluna ausente."""
+                if col in df.columns:
+                    return df[col].fillna("").astype(str).str.lower()
+                return pd.Series("", index=df.index)
+
             mask = (
-                runs_df.get("tags.mlflow.runName", "").str.lower().str.contains(agent_id_lower, na=False)
-                | runs_df.get("tags.service_name", "").str.lower().str.contains(agent_id_lower, na=False)
-                | runs_df.get("tags.trace_id", "").str.lower().str.contains(agent_id_lower, na=False)
+                _scol(runs_df, "tags.mlflow.runName").str.contains(agent_id_lower, na=False)
+                | _scol(runs_df, "tags.service_name").str.contains(agent_id_lower, na=False)
+                | _scol(runs_df, "tags.trace_id").str.contains(agent_id_lower, na=False)
             )
             runs_df = runs_df[mask].head(limit)
 
@@ -450,10 +461,17 @@ def get_agent_runs(run_name: str, limit: int = 100, only_successful: bool = Fals
             raise HTTPException(status_code=404, detail=f"Nenhuma run encontrada para '{run_name}'.")
 
         # Filtra por substring em run_name ou service_name tag
+        import pandas as pd
         run_name_lower = run_name.lower()
+
+        def _scol(df, col):
+            if col in df.columns:
+                return df[col].fillna("").astype(str).str.lower()
+            return pd.Series("", index=df.index)
+
         mask = (
-            runs_df.get("tags.mlflow.runName", "").str.lower().str.contains(run_name_lower, na=False)
-            | runs_df.get("tags.service_name", "").str.lower().str.contains(run_name_lower, na=False)
+            _scol(runs_df, "tags.mlflow.runName").str.contains(run_name_lower, na=False)
+            | _scol(runs_df, "tags.service_name").str.contains(run_name_lower, na=False)
         )
         runs_df = runs_df[mask].head(limit)
 
